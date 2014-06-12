@@ -1,0 +1,58 @@
+From 7ff02dff6d7236a48aeb758f069518553feaa887 Mon Sep 17 00:00:00 2001
+From: Devin Ryan <devin@forairan.com>
+Date: Thu, 12 Jun 2014 00:30:09 -0500
+Subject: [PATCH] Donkeychunk: mc-dev imports
+
+
+diff --git a/src/main/java/net/minecraft/server/ServerNBTManager.java b/src/main/java/net/minecraft/server/ServerNBTManager.java
+new file mode 100644
+index 0000000..6f2e7d9
+--- /dev/null
++++ b/src/main/java/net/minecraft/server/ServerNBTManager.java
+@@ -0,0 +1,43 @@
++package net.minecraft.server;
++
++import java.io.File;
++
++public class ServerNBTManager extends WorldNBTStorage {
++
++    public ServerNBTManager(File file1, String s, boolean flag) {
++        super(file1, s, flag);
++    }
++
++    public IChunkLoader createChunkLoader(WorldProvider worldprovider) {
++        File file1 = this.getDirectory();
++        File file2;
++
++        if (worldprovider instanceof WorldProviderHell) {
++            file2 = new File(file1, "DIM-1");
++            file2.mkdirs();
++            return new ChunkRegionLoader(file2);
++        } else if (worldprovider instanceof WorldProviderTheEnd) {
++            file2 = new File(file1, "DIM1");
++            file2.mkdirs();
++            return new ChunkRegionLoader(file2);
++        } else {
++            return new ChunkRegionLoader(file1);
++        }
++    }
++
++    public void saveWorldData(WorldData worlddata, NBTTagCompound nbttagcompound) {
++        worlddata.e(19133);
++        super.saveWorldData(worlddata, nbttagcompound);
++    }
++
++    public void a() {
++        // CraftBukkit start - remove catch block
++        //try {
++            FileIOThread.a.a();
++        //} catch (InterruptedException interruptedexception) {
++        //    interruptedexception.printStackTrace();
++        //} // CraftBukkit end
++
++        RegionFileCache.a();
++    }
++}
+-- 
+1.9.2.msysgit.0
+

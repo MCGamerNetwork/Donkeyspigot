@@ -1,0 +1,601 @@
+From 2c93903fb445d072403243094d26b13181661441 Mon Sep 17 00:00:00 2001
+From: Devin Ryan <devin@forairan.com>
+Date: Thu, 12 Jun 2014 15:39:48 -0500
+Subject: [PATCH] Donkeychunk implementation
+
+
+diff --git a/pom.xml b/pom.xml
+index c1073e5..7591ad5 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -113,6 +113,11 @@
+       <artifactId>trove4j</artifactId>
+       <version>3.0.3</version>
+     </dependency>
++    <dependency>
++      <groupId>net.donkeychunk</groupId>
++      <artifactId>Donkeychunk</artifactId>
++      <version>1.0.0</version>
++    </dependency>
+   </dependencies>
+ 
+   <!-- This builds a completely 'ready to start' jar with all dependencies inside -->
+diff --git a/src/main/java/net/donkeychunk/server/CraftDonkeyChunkLoader.java b/src/main/java/net/donkeychunk/server/CraftDonkeyChunkLoader.java
+new file mode 100644
+index 0000000..51ce1a6
+--- /dev/null
++++ b/src/main/java/net/donkeychunk/server/CraftDonkeyChunkLoader.java
+@@ -0,0 +1,385 @@
++package net.donkeychunk.server;
++
++import com.evilco.mc.nbt.stream.NbtInputStream;
++import com.evilco.mc.nbt.stream.NbtOutputStream;
++import com.evilco.mc.nbt.tag.TagCompound;
++import com.evilco.mc.nbt.tag.TagList;
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.DataInput;
++import java.io.DataInputStream;
++import java.io.DataOutput;
++import java.io.DataOutputStream;
++import java.io.File;
++import java.io.IOException;
++import java.util.Collection;
++import java.util.LinkedHashMap;
++import java.util.List;
++import net.donkeychunk.java.chunk.DonkeyChunk;
++import net.donkeychunk.java.chunk.DonkeyChunkFlags;
++import net.donkeychunk.java.chunk.DonkeyChunkHandler;
++import net.donkeychunk.java.chunk.DonkeyChunkSection;
++import net.donkeychunk.java.region.DonkeyTileTick;
++import net.minecraft.server.Block;
++import net.minecraft.server.Chunk;
++import net.minecraft.server.ChunkCoordIntPair;
++import net.minecraft.server.ChunkSection;
++import net.minecraft.server.Entity;
++import net.minecraft.server.EntityTypes;
++import net.minecraft.server.ExceptionWorldConflict;
++import net.minecraft.server.FileIOThread;
++import net.minecraft.server.IAsyncChunkSaver;
++import net.minecraft.server.IChunkLoader;
++import net.minecraft.server.NBTCompressedStreamTools;
++import net.minecraft.server.NBTReadLimiter;
++import net.minecraft.server.NBTTagCompound;
++import net.minecraft.server.NBTTagList;
++import net.minecraft.server.NextTickListEntry;
++import net.minecraft.server.NibbleArray;
++import net.minecraft.server.TileEntity;
++import net.minecraft.server.World;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++/**
++ * Implementation of DonkeyChunkHandler.
++ */
++public class CraftDonkeyChunkLoader implements IChunkLoader, IAsyncChunkSaver {
++
++    private static final Logger log = LogManager.getLogger();
++    private final LinkedHashMap<ChunkCoordIntPair, Chunk> pendingSaves = new LinkedHashMap<ChunkCoordIntPair, Chunk>();
++    private final Object lock = new Object();
++    private final File worldFile;
++    private final DonkeyChunkHandler handler;
++
++    public CraftDonkeyChunkLoader(File world) {
++        this.worldFile = world;
++        this.handler = new DonkeyChunkHandler(world);
++    }
++
++    /**
++     * Loads a chunk at the given X and Z coordinates and returns it.
++     *
++     * @param world
++     * @param x
++     * @param z
++     * @return
++     */
++    @Override
++    public Chunk a(World world, int x, int z) {
++        try {
++            DonkeyChunk donkeyChunk = handler.getChunk(x, z);
++            if (donkeyChunk == null) {
++                return null;
++            }
++
++            Chunk chunk = new Chunk(world, x, z);
++            chunk.lit = donkeyChunk.isLightPopulated();
++            chunk.done = donkeyChunk.isTerrainPopulated();
++            chunk.s = donkeyChunk.getInhabitedTime();
++            chunk.heightMap = donkeyChunk.getHeightMap();
++
++            if (donkeyChunk.getBiomeMap() != null) {
++                chunk.a(donkeyChunk.getBiomeMap());
++            }
++
++            ChunkSection[] sections = new ChunkSection[16];
++            for (int i = 0; i < donkeyChunk.getSections().length; i++) {
++                DonkeyChunkSection donkeySection = donkeyChunk.getSections()[i];
++
++                if (donkeySection != null) {
++                    ChunkSection section = new ChunkSection(donkeySection.getY() << 4, !donkeyChunk.getFlags().isSkyLightPresent());
++
++                    section.setIdArray(donkeySection.getBlockArray());
++                    section.setDataArray(new NibbleArray(donkeySection.getBlockDataArray(), 4));
++
++                    if (donkeyChunk.getFlags().isAddBlockArrayPresent()) {
++                        section.setExtendedIdArray(new NibbleArray(donkeySection.getBlockAddArray(), 4));
++                    }
++
++                    if (donkeyChunk.getFlags().isBlockLightPresent()) {
++                        section.setEmittedLightArray(new NibbleArray(donkeySection.getLightArray(), 4));
++                    }
++
++                    if (donkeyChunk.getFlags().isSkyLightPresent()) {
++                        section.setSkyLightArray(new NibbleArray(donkeySection.getSkyLightArray(), 4));
++                    }
++
++                    section.recalcBlockCounts();
++                    sections[i] = section;
++                }
++            }
++
++            chunk.a(sections);
++
++            if (!donkeyChunk.getFlags().isSkyLightPresent()) {
++                world.worldProvider.g = false;
++                chunk.initLighting();
++            }
++
++            // Tile Ticks
++            for (DonkeyTileTick tick : donkeyChunk.getTileTicks()) {
++                world.b((x << 4) + tick.getX(), tick.getY(), (z << 4) + tick.getZ(), Block.e(tick.getBlock()), tick.getTicksLeft(), tick.getPriority());
++            }
++
++            // Entities / Tile Entities
++            // To convert Donkey's NBT lib to NMS, the easiest way is to write it out first...
++            ByteArrayOutputStream baos = new ByteArrayOutputStream();
++            NbtOutputStream nbtOut = new NbtOutputStream(baos);
++            TagCompound rootTag = new TagCompound("NBTAdd");
++
++            if (donkeyChunk.getFlags().isEntityListPresent()) {
++                TagList nbtEntityList = new TagList("Entities", donkeyChunk.getEntityList());
++                rootTag.setTag(nbtEntityList);
++            }
++
++            if (donkeyChunk.getFlags().isTileEntityListPresent()) {
++                TagList nbtTileEntityList = new TagList("TileEntities", donkeyChunk.getTileEntityList());
++                rootTag.setTag(nbtTileEntityList);
++            }
++
++            nbtOut.write(rootTag);
++            nbtOut.close();
++
++            // ... then read it in
++            DataInputStream dataIn = new DataInputStream(new ByteArrayInputStream(baos.toByteArray()));
++            NBTTagCompound compound = NBTCompressedStreamTools.a((DataInput) dataIn, NBTReadLimiter.a);
++
++            if (donkeyChunk.getFlags().isEntityListPresent()) {
++                NBTTagList entityList = compound.getList("Entities", 10);
++                if (entityList != null) {
++                    for (int i = 0; i < entityList.size(); i++) {
++                        NBTTagCompound entityTag = entityList.get(i);
++                        Entity entity = EntityTypes.a(entityTag, world);
++
++                        chunk.o = true;
++                        if (entity != null) {
++                            chunk.a(entity);
++
++                            // Recursive riding support
++                            Entity previousEntity = entity;
++
++                            for (NBTTagCompound nextCompound = entityTag; nextCompound.hasKeyOfType("Riding", 10); nextCompound = nextCompound.getCompound("Riding")) {
++                                Entity nextEntity = EntityTypes.a(nextCompound.getCompound("Riding"), world);
++
++                                if (nextEntity != null) {
++                                    chunk.a(nextEntity);
++                                    previousEntity.mount(nextEntity);
++                                }
++
++                                previousEntity = nextEntity;
++                            }
++                        }
++                    }
++                }
++            }
++
++            if (donkeyChunk.getFlags().isTileEntityListPresent()) {
++                NBTTagList tileEntityList = compound.getList("TileEntities", 10);
++                if (tileEntityList != null) {
++                    for (int i = 0; i < tileEntityList.size(); i++) {
++                        NBTTagCompound tileEntityTag = tileEntityList.get(i);
++                        TileEntity tileEntity = TileEntity.c(tileEntityTag);
++
++                        if (tileEntity != null) {
++                            chunk.a(tileEntity);
++                        }
++                    }
++                }
++            }
++
++            return chunk;
++        } catch (IOException ex) {
++            ex.printStackTrace();
++            return null;
++        }
++    }
++
++    /**
++     * Saves the chunk.
++     *
++     * @param world
++     * @param chunk
++     */
++    @Override
++    public void a(World world, Chunk chunk) {
++        try {
++            world.G();
++        } catch (ExceptionWorldConflict ex) {
++            ex.printStackTrace();
++        }
++
++        synchronized (lock) {
++            if (!pendingSaves.containsKey(chunk.l())) {
++                pendingSaves.put(chunk.l(), chunk);
++            }
++        }
++
++        FileIOThread.a.a(this);
++    }
++
++    @Override
++    public void b(World world, Chunk chunk) {
++    }
++
++    /**
++     * Waits for chunks to load, I assume?
++     */
++    @Override
++    public void a() {
++    }
++
++    /**
++     * Waits for chunks to save.
++     */
++    @Override
++    public void b() {
++        while (this.c()) {
++            Thread.yield();
++        }
++    }
++
++    /**
++     * Checks to see if chunks are still saving.
++     *
++     * @return true if chunks are still saving
++     */
++    @Override
++    public boolean c() {
++        Chunk chunk = null;
++        synchronized (lock) {
++            if (pendingSaves.size() < 1) {
++                return false;
++            }
++
++            chunk = pendingSaves.values().iterator().next();
++            if (chunk == null) {
++                return false;
++            }
++
++            pendingSaves.remove(chunk.l());
++        }
++
++        if (chunk != null) {
++            try {
++                World world = chunk.world;
++                ChunkSection[] sections = chunk.i();
++                DonkeyChunkFlags flags = new DonkeyChunkFlags(chunk.donkeyFlags);
++                DonkeyChunk donkeyChunk = new DonkeyChunk(chunk.l().x, chunk.l().z, flags);
++
++                flags.setBiomeArrayPresent(false);
++                flags.setAddBlockArrayPresent(false);
++
++                // Do any flags need to be updated?
++                // Biomes
++                for (byte b : chunk.m()) {
++                    if (b != 0) {
++                        flags.setBiomeArrayPresent(true);
++                        break;
++                    }
++                }
++
++                // Add block array
++                for (ChunkSection section : sections) {
++                    if (section != null && section.getExtendedIdArray() != null) {
++                        if (!section.getExtendedIdArray().isTrivialArray()) {
++                            flags.setAddBlockArrayPresent(true);
++                            break;
++                        }
++                    }
++                }
++
++                // Start filling in the DonkeyChunk
++                donkeyChunk.setTerrainPopulated(chunk.done);
++                donkeyChunk.setLightPopulated(chunk.lit);
++                donkeyChunk.setInhabitedTime(chunk.s);
++                donkeyChunk.setHeightMap(chunk.heightMap);
++                if (flags.isBiomeArrayPresent()) {
++                    donkeyChunk.setBiomeMap(chunk.m());
++                }
++
++                // Start populating sections
++                DonkeyChunkSection[] donkeySections = new DonkeyChunkSection[16];
++                for (int i = 0; i < sections.length; i++) {
++                    ChunkSection section = sections[i];
++
++                    if (section != null) {
++                        DonkeyChunkSection donkeySection = new DonkeyChunkSection(section.getYPosition() >> 4 & 255);
++                        donkeySection.setBlockArray(section.getIdArray());
++                        donkeySection.setBlockDataArray(section.getDataArray().getValueArray());
++
++                        if (flags.isAddBlockArrayPresent()) {
++                            donkeySection.setBlockAddArray(section.getExtendedIdArray().getValueArray());
++                        }
++
++                        if (flags.isBlockLightPresent()) {
++                            donkeySection.setLightArray(section.getEmittedLightArray().getValueArray());
++                        }
++
++                        if (flags.isSkyLightPresent()) {
++                            donkeySection.setSkyLightArray(section.getSkyLightArray().getValueArray());
++                        }
++
++                        donkeySections[section.getYPosition() >> 4 & 255] = donkeySection;
++                    }
++                }
++                donkeyChunk.setSections(donkeySections);
++
++                // Tile Ticks
++                List<NextTickListEntry> tickList = world.a(chunk, false);
++                if (tickList != null) {
++                    int tickListLength = tickList.size();
++                    long worldTime = world.getTime();
++
++                    for (NextTickListEntry entry : tickList) {
++                        donkeyChunk.getTileTicks().add(new DonkeyTileTick(entry.a & 15, entry.b & 255, entry.c & 15, Block.b(entry.a()), (int) (entry.d - worldTime), entry.e));
++                    }
++                }
++
++                // Entities
++                chunk.o = false;
++                for (int i = 0; i < chunk.entitySlices.length; i++) {
++                    for (Entity entity : (List<Entity>) chunk.entitySlices[i]) {
++                        // This is kinda messy, TODO maybe clean it up?
++                        NBTTagCompound entityTag = new NBTTagCompound();
++
++                        if (entity.d(entityTag)) {
++                            chunk.o = true;
++
++                            ByteArrayOutputStream baos = new ByteArrayOutputStream();
++                            DataOutputStream out = new DataOutputStream(baos);
++                            NBTCompressedStreamTools.a(entityTag, (DataOutput) out);
++                            out.close();
++
++                            NbtInputStream in = new NbtInputStream(new ByteArrayInputStream(baos.toByteArray()));
++                            donkeyChunk.getEntityList().add(in.readTag());
++                        }
++                    }
++                }
++
++                // Tile Entities
++                for (TileEntity tileEntity : (Collection<TileEntity>) chunk.tileEntities.values()) {
++                    // This is kinda messy, TODO maybe clean it up?
++                    NBTTagCompound tileEntityTag = new NBTTagCompound();
++                    tileEntity.b(tileEntityTag);
++
++                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
++                    DataOutputStream out = new DataOutputStream(baos);
++                    NBTCompressedStreamTools.a(tileEntityTag, (DataOutput) out);
++                    out.close();
++
++                    NbtInputStream in = new NbtInputStream(new ByteArrayInputStream(baos.toByteArray()));
++                    donkeyChunk.getTileEntityList().add(in.readTag());
++                }
++
++                // Now let Donkey do the rest of the work.
++                handler.saveChunk(donkeyChunk);
++            } catch (IOException ex) {
++                ex.printStackTrace();
++            }
++        }
++
++        return pendingSaves.size() > 0;
++    }
++
++}
+diff --git a/src/main/java/net/donkeychunk/server/DonkeyLoaderServer.java b/src/main/java/net/donkeychunk/server/DonkeyLoaderServer.java
+new file mode 100644
+index 0000000..c08413e
+--- /dev/null
++++ b/src/main/java/net/donkeychunk/server/DonkeyLoaderServer.java
+@@ -0,0 +1,29 @@
++package net.donkeychunk.server;
++
++import java.io.File;
++import net.donkeychunk.java.DonkeyConstants;
++import net.minecraft.server.WorldData;
++import net.minecraft.server.WorldLoaderServer;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++/**
++ * Donkeychunk extension of WorldLoaderServer.
++ */
++public class DonkeyLoaderServer extends WorldLoaderServer {
++
++    private static final Logger log = LogManager.getLogger();
++    
++    public DonkeyLoaderServer(File file) {
++        super(file);
++    }
++    
++    @Override
++    public boolean isConvertable(String s) {
++        WorldData data = this.c(s);
++        
++        // Allow for dual compatibility with Anvil and Donkeychunk
++        return data != null && data.l() < DonkeyConstants.DONKEY_MAGIC && data.l() != this.c();
++    }
++
++}
+diff --git a/src/main/java/net/minecraft/server/Chunk.java b/src/main/java/net/minecraft/server/Chunk.java
+index 620561b..f1e5981 100644
+--- a/src/main/java/net/minecraft/server/Chunk.java
++++ b/src/main/java/net/minecraft/server/Chunk.java
+@@ -41,6 +41,7 @@ public class Chunk {
+     public long s;
+     private int x;
+     protected gnu.trove.map.hash.TObjectIntHashMap<Class> entityCount = new gnu.trove.map.hash.TObjectIntHashMap<Class>(); // Spigot
++    public int donkeyFlags = 0; // Donkeychunk - keep track of flags
+ 
+     public Chunk(World world, int i, int j) {
+         this.sections = new ChunkSection[16];
+diff --git a/src/main/java/net/minecraft/server/DedicatedServer.java b/src/main/java/net/minecraft/server/DedicatedServer.java
+index 62d5847..fbbe3cd 100644
+--- a/src/main/java/net/minecraft/server/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/DedicatedServer.java
+@@ -31,6 +31,7 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+     private boolean generateStructures;
+     private EnumGamemode o;
+     private boolean p;
++    private static boolean useDonkeychunk; // Donkeychunk
+ 
+     // CraftBukkit start - Signature changed
+     public DedicatedServer(joptsimple.OptionSet options) {
+@@ -81,6 +82,7 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+             this.c(this.propertyManager.getString("server-ip", ""));
+         }
+ 
++        this.useDonkeychunk = this.propertyManager.getBoolean("use-donkeychunk", true); // Donkeychunk
+         this.setSpawnAnimals(this.propertyManager.getBoolean("spawn-animals", true));
+         this.setSpawnNPCs(this.propertyManager.getBoolean("spawn-npcs", true));
+         this.setPvP(this.propertyManager.getBoolean("pvp", true));
+@@ -151,7 +153,7 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+             return false;
+         } else {
+             // this.a((PlayerList) (new DedicatedPlayerList(this))); // CraftBukkit - moved up
+-            this.convertable = new WorldLoaderServer(server.getWorldContainer()); // CraftBukkit - moved from MinecraftServer constructor
++            this.convertable = new net.donkeychunk.server.DonkeyLoaderServer(server.getWorldContainer()); // CraftBukkit - moved from MinecraftServer constructor // Donkeychunk
+             long j = System.nanoTime();
+ 
+             if (this.O() == null) {
+@@ -239,6 +241,12 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+         return this.propertyManager;
+     }
+     // CraftBukkit end
++    
++    // Donkeychunk start
++    public static boolean isUsingDonkeychunk() {
++        return useDonkeychunk;
++    }
++    // Donkeychunk end
+ 
+     public boolean getGenerateStructures() {
+         return this.generateStructures;
+diff --git a/src/main/java/net/minecraft/server/ServerNBTManager.java b/src/main/java/net/minecraft/server/ServerNBTManager.java
+index 6f2e7d9..fe3695c 100644
+--- a/src/main/java/net/minecraft/server/ServerNBTManager.java
++++ b/src/main/java/net/minecraft/server/ServerNBTManager.java
+@@ -1,6 +1,9 @@
+ package net.minecraft.server;
+ 
+ import java.io.File;
++import net.donkeychunk.java.DonkeyConstants;
++import net.donkeychunk.server.CraftDonkeyChunkLoader;
++// Donkeychunk end
+ 
+ public class ServerNBTManager extends WorldNBTStorage {
+ 
+@@ -15,18 +18,18 @@ public class ServerNBTManager extends WorldNBTStorage {
+         if (worldprovider instanceof WorldProviderHell) {
+             file2 = new File(file1, "DIM-1");
+             file2.mkdirs();
+-            return new ChunkRegionLoader(file2);
++            return (worldprovider.b.worldData != null && worldprovider.b.worldData.l() >= DonkeyConstants.DONKEY_MAGIC) || DedicatedServer.isUsingDonkeychunk() ? new CraftDonkeyChunkLoader(file2) : new ChunkRegionLoader(file2); // Donkeychunk
+         } else if (worldprovider instanceof WorldProviderTheEnd) {
+             file2 = new File(file1, "DIM1");
+             file2.mkdirs();
+-            return new ChunkRegionLoader(file2);
++            return (worldprovider.b.worldData != null && worldprovider.b.worldData.l() >= DonkeyConstants.DONKEY_MAGIC) || DedicatedServer.isUsingDonkeychunk() ? new CraftDonkeyChunkLoader(file2) : new ChunkRegionLoader(file2); // Donkeychunk
+         } else {
+-            return new ChunkRegionLoader(file1);
++            return (worldprovider.b.worldData != null && worldprovider.b.worldData.l() >= DonkeyConstants.DONKEY_MAGIC) || DedicatedServer.isUsingDonkeychunk() ? new CraftDonkeyChunkLoader(file1) : new ChunkRegionLoader(file1); // Donkeychunk
+         }
+     }
+ 
+     public void saveWorldData(WorldData worlddata, NBTTagCompound nbttagcompound) {
+-        worlddata.e(19133);
++        worlddata.e(worlddata.l() >= DonkeyConstants.DONKEY_MAGIC ? 19133 : DonkeyConstants.DONKEY_MAGIC); // Donkeychunk
+         super.saveWorldData(worlddata, nbttagcompound);
+     }
+ 
+diff --git a/src/main/java/net/minecraft/server/WorldServer.java b/src/main/java/net/minecraft/server/WorldServer.java
+index 2dc3a13..f8b0cb4 100644
+--- a/src/main/java/net/minecraft/server/WorldServer.java
++++ b/src/main/java/net/minecraft/server/WorldServer.java
+@@ -43,6 +43,7 @@ public class WorldServer extends World {
+     private static final StructurePieceTreasure[] U = new StructurePieceTreasure[] { new StructurePieceTreasure(Items.STICK, 0, 1, 3, 10), new StructurePieceTreasure(Item.getItemOf(Blocks.WOOD), 0, 1, 3, 10), new StructurePieceTreasure(Item.getItemOf(Blocks.LOG), 0, 1, 3, 10), new StructurePieceTreasure(Items.STONE_AXE, 0, 1, 1, 3), new StructurePieceTreasure(Items.WOOD_AXE, 0, 1, 1, 5), new StructurePieceTreasure(Items.STONE_PICKAXE, 0, 1, 1, 3), new StructurePieceTreasure(Items.WOOD_PICKAXE, 0, 1, 1, 5), new StructurePieceTreasure(Items.APPLE, 0, 2, 3, 5), new StructurePieceTreasure(Items.BREAD, 0, 2, 3, 3), new StructurePieceTreasure(Item.getItemOf(Blocks.LOG2), 0, 1, 3, 10)};
+     private List V = new ArrayList();
+     private IntHashMap entitiesById;
++    private final Object tileTickLock = new Object(); // Donkeychunk
+ 
+     // CraftBukkit start
+     public final int dimension;
+@@ -482,11 +483,12 @@ public class WorldServer extends World {
+                 nextticklistentry.a((long) l + this.worldData.getTime());
+                 nextticklistentry.a(i1);
+             }
+-
++            synchronized (tileTickLock) { // Donkeychunk
+             if (!this.M.contains(nextticklistentry)) {
+                 this.M.add(nextticklistentry);
+                 this.N.add(nextticklistentry);
+             }
++            } // Donkeychunk
+         }
+     }
+ 
+@@ -521,6 +523,7 @@ public class WorldServer extends World {
+     }
+ 
+     public boolean a(boolean flag) {
++        synchronized (tileTickLock) { // Donkeychunk
+         int i = this.N.size();
+ 
+         if (i != this.M.size()) {
+@@ -591,6 +594,7 @@ public class WorldServer extends World {
+             this.V.clear();
+             return !this.N.isEmpty();
+         }
++        } // Donkeychunk
+     }
+ 
+     public List a(Chunk chunk, boolean flag) {
+@@ -601,6 +605,7 @@ public class WorldServer extends World {
+         int k = (chunkcoordintpair.z << 4) - 2;
+         int l = k + 16 + 2;
+ 
++        synchronized (tileTickLock) { // Donkeychunk
+         for (int i1 = 0; i1 < 2; ++i1) {
+             Iterator iterator;
+ 
+@@ -630,7 +635,7 @@ public class WorldServer extends World {
+                 }
+             }
+         }
+-
++        } // Donkeychunk
+         return arraylist;
+     }
+ 
+-- 
+1.9.2.msysgit.0
+
