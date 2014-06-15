@@ -1,8 +1,7 @@
-Spigot [![Build Status](https://travis-ci.org/SpigotMC/Spigot.png)](https://travis-ci.org/SpigotMC/Spigot)
+Donkeyspigot [![Build Status](https://travis-ci.org/SpigotMC/Spigot.png)](https://travis-ci.org/SpigotMC/Spigot)
 ===========
 
-High performance Minecraft server implementation
-
+Fork of Spigot, the high performance Minecraft server implementation, with support for Donkeychunk, the highly space efficient level storage format.
 
 How To
 -----------
@@ -10,6 +9,8 @@ How To
 Init a Craftbukkit and Bukkit module : `git submodule update --init`
 
 Apply Patches : `./applyPatches.sh`
+
+[Download the Donkeychunk library by clicking here.](https://github.com/MCGamerNetwork/Donkeychunk) You'll need it to compile Donkeyspigot.
 
 ### Create patch for server ###
 
